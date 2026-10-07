@@ -1,0 +1,38 @@
+using System.Linq;
+using org.objectweb.asm;
+using org.objectweb.asm.commons;
+
+internal class SwapNettyBackendTransform(string name, ClassWriter writer) : ClassRemapper(writer, RemapperForClass(name))
+{
+	private const string McConnection = "net.minecraft.network.Connection";
+	private const string McServerStatusPinger = "net.minecraft.client.multiplayer.ServerStatusPinger";
+	private const string McServerConnectionListener = "net.minecraft.server.network.ServerConnectionListener";
+
+    private const string NioEventLoopGroup = "io/netty/channel/nio/NioEventLoopGroup";
+    private const string DefaultEventLoopGroup = "io/netty/channel/DefaultEventLoopGroup";
+    private const string NioSocketChannel = "io/netty/channel/socket/nio/NioSocketChannel";
+    private const string IkvmWebSocketChannel = "cli/IkvmWebSocketChannel";
+
+	public static IkvmClassLoaderTransformer Transformer = () => {
+		string[] classes = [McConnection, McServerStatusPinger, McServerConnectionListener];
+		return (classes.Select(x => Mappings.CurrentMappings.GetClass(x).Name).ToArray(), typeof(SwapNettyBackendTransform));
+	};
+
+	private static SimpleRemapper RemapperForClass(string name)
+	{
+		java.util.HashMap map = [];
+
+		if (name == Mappings.CurrentMappings.GetClass(McServerConnectionListener).Name)
+		{
+			map.put(NioEventLoopGroup, DefaultEventLoopGroup);
+		}
+		else
+		{
+			if (name == Mappings.CurrentMappings.GetClass(McConnection).Name)
+				map.put(NioEventLoopGroup, DefaultEventLoopGroup);
+			map.put(NioSocketChannel, IkvmWebSocketChannel);
+		}
+
+		return new(Opcodes.ASM9, map);
+	}
+}

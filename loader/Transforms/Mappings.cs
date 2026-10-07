@@ -1,0 +1,326 @@
+using System;
+using System.Linq;
+using System.Collections.Generic;
+using System.Text;
+using System.Text.RegularExpressions;
+
+internal interface IClassMapping
+{
+	public string Name { get; }
+	public string GetField(string field);
+	public string GetMethod(string method, string signature);
+}
+
+internal interface IMappings
+{
+	public IClassMapping GetClass(string klass);
+}
+
+partial class MojmapClassMapping : IClassMapping
+{
+	[GeneratedRegex(@"^\s*\d*:\d*:(?<Unmapped>.*) -> (?<Mapped>.*)$")]
+	private static partial Regex Pattern { get; }
+
+	public string Unmapped;
+	public string Mapped;
+	public Dictionary<string, string> Fields;
+	public Dictionary<(string, string), string> Methods;
+
+	private static string MojmapTypeToJvm(string mojmap)
+	{
+		if (mojmap.EndsWith("[]"))
+			return "[" + MojmapTypeToJvm(mojmap[..^2]);
+
+		return mojmap switch
+		{
+			"void"    => "V",
+			"boolean" => "Z",
+			"byte"    => "B",
+			"char"    => "C",
+			"short"   => "S",
+			"int"     => "I",
+			"long"    => "J",
+			"float"   => "F",
+			"double"  => "D",
+			_ => $"L{mojmap.Replace(".", "/")};",
+		};
+	}
+
+	private static (string, string) MojmapToTiny(string mojmap)
+	{
+		var space = mojmap.IndexOf(" ");
+		var retType = mojmap[0..space];
+		var rest = mojmap[(space + 1)..];
+
+		var sigStart = rest.IndexOf("(");
+		var sigEnd = rest.LastIndexOf(")");
+		var paramTypeStr = rest[(sigStart + 1)..sigEnd];
+		var name = rest[..sigStart];
+
+		var paramTypes = (paramTypeStr.Length == 0 ? [] : paramTypeStr.Split(",")).Select(MojmapTypeToJvm);
+
+		return (name, "(" + string.Join("", paramTypes) + ")" + MojmapTypeToJvm(retType)); 
+	}
+
+	public MojmapClassMapping(string unmapped, string mapped, Group contents)
+	{
+		Unmapped = unmapped;
+		Mapped = mapped;
+		Fields = [];
+		Methods = [];
+
+		foreach (Capture c in contents.Captures)
+		{
+			var val = c.Value;
+			var matches = Pattern.Matches(val);
+			if (matches.Count > 0)
+			{
+				var g = matches[0].Groups;
+				var unmapped_f = MojmapToTiny(g["Unmapped"].Value);
+				var mapped_f = g["Mapped"].Value;
+				Methods[unmapped_f] = mapped_f;
+				//Console.WriteLine($"[Mojmap]\tmethod '{unmapped_f.Item1}' '{unmapped_f.Item2}' -> '{mapped_f}'");
+			}
+			else
+			{
+				var split = val.Split(" -> ");
+				var unmapped_f = split[0].Split(" ")[1];
+				var mapped_f = split[1].Trim();
+				Fields[unmapped_f] = mapped_f;
+				//Console.WriteLine($"[Mojmap]\tfield {unmapped_f} -> {mapped_f}");
+			}
+		}
+	}
+
+	public string Name => Mapped;
+
+	public string GetField(string field)
+	{
+		Fields.TryGetValue(field, out var Field);
+		return Field;
+	}
+
+	public string GetMethod(string method, string signature)
+	{
+		Methods.TryGetValue((method, signature), out var Method);
+		return Method;
+	}
+}
+
+internal partial class MojmapMappings : IMappings
+{
+	[GeneratedRegex(@"(?<Unmapped>.*) -> (?<Mapped>.*):\n(?<Contents>    .*\n?)*")]
+	private static partial Regex Pattern { get; }
+
+	private readonly Dictionary<string, MojmapClassMapping> Classes = [];
+
+	public MojmapMappings(string contents)
+	{
+		foreach (Match m in Pattern.Matches(contents))
+		{
+			var unmapped = m.Groups["Unmapped"].Value;
+			var mapped = m.Groups["Mapped"].Value;
+			Classes[unmapped] = new(unmapped, mapped, m.Groups["Contents"]);
+			//Console.WriteLine($"[Mojmap] class {unmapped} -> {mapped}");
+		}
+	}
+
+	public IClassMapping GetClass(string klass)
+	{
+		Classes.TryGetValue(klass, out var Klass);
+		return Klass;
+	}
+}
+
+internal class TinyV1ClassMapping : IClassMapping
+{
+	public string Unmapped;
+	public string Mapped;
+	public Dictionary<string, string> Fields;
+	public Dictionary<(string, string), string> Methods;
+
+	public string Name => Mapped;
+
+	public string GetField(string field)
+	{
+		Fields.TryGetValue(field, out var Field);
+		return Field;
+	}
+
+	public string GetMethod(string method, string signature)
+	{
+		Methods.TryGetValue((method, signature), out var Method);
+		return Method;
+	}
+}
+
+internal class TinyV1Mappings : IMappings
+{
+	private readonly Dictionary<string, TinyV1ClassMapping> Classes = [];
+
+	public static TinyV1Mappings FromResource(java.io.InputStream stream)
+	{
+        byte[] bytes;
+        try
+        {
+            var output = new java.io.ByteArrayOutputStream();
+            var buffer = new byte[8192];
+            int n;
+            while ((n = stream.read(buffer)) > 0)
+            {
+                output.write(buffer, 0, n);
+            }
+            bytes = output.toByteArray();
+        }
+        finally
+        {
+            stream.close();
+        }
+
+		return new(Encoding.UTF8.GetString(bytes));
+	}
+
+	public TinyV1Mappings(string contents)
+	{
+		string unmapped = "";
+		string mapped = "";
+		Dictionary<string, string> fields = [];
+		Dictionary<(string, string), string> methods = [];
+		foreach (var line in contents.Split("\n").Skip(1))
+		{
+			var parts = line.Split("\t");
+			switch (parts[0]) {
+				case "CLASS":
+					if (unmapped != "" && mapped != "") {
+						// flush to class list
+						Classes[unmapped] = new() {
+							Unmapped = unmapped,
+							Mapped = mapped,
+							Fields = fields,
+							Methods = methods,
+						};
+						fields = [];
+						methods = [];
+					}
+					unmapped = parts[1].Replace("/", ".");
+					mapped = parts[2].Replace("/", ".");
+					break;
+
+				case "FIELD":
+					fields[parts[3]] = parts[4];
+					break;
+
+				case "METHOD":
+					methods[(parts[3], parts[2])] = parts[4];
+					//Console.WriteLine($"[Tiny] method {parts[3]} {parts[2]} {parts[4]}");
+					break;
+			};
+		}
+		Classes[unmapped] = new() {
+			Unmapped = unmapped,
+			Mapped = mapped,
+			Fields = fields,
+			Methods = methods,
+		};
+	}
+
+	public IClassMapping GetClass(string klass)
+	{
+		Classes.TryGetValue(klass, out var Klass);
+		return Klass;
+	}
+}
+
+internal sealed class IdentityClassMapping(string klass) : IClassMapping
+{
+	public string Name => klass;
+	public string GetField(string field) => field;
+	public string GetMethod(string method, string signature) => method;
+}
+
+internal sealed class IdentityMappings : IMappings
+{
+	public IClassMapping GetClass(string klass) => new IdentityClassMapping(klass);
+}
+
+internal struct IntermediaryClassMappings(IMappings OneMappings, IClassMapping One, IClassMapping Two) : IClassMapping
+{
+	public readonly string Name => Two.Name;
+
+	public readonly string GetField(string field)
+	{
+		var one = One.GetField(field);
+		if (one == null)
+			return null;
+		return Two.GetField(one);
+	}
+
+	public readonly string GetMethod(string method, string signature)
+	{
+		var one = One.GetMethod(method, signature);
+		//Console.WriteLine($"[Intermediary] GetMethod One {method} {signature} {one}"); 
+		if (one == null)
+			return null;
+		var two = Two.GetMethod(one, Mappings.RemapClassSignature(OneMappings, signature));
+		//Console.WriteLine($"[Intermediary] GetMethod Two {one} {Mappings.RemapClassSignature(OneMappings, signature)} {two}"); 
+		return two;
+	}
+}
+
+internal struct IntermediaryMappings(IMappings One, IMappings Two) : IMappings
+{
+	public readonly IClassMapping GetClass(string klass)
+	{
+		var official = One.GetClass(klass);
+		//Console.WriteLine($"[Intermediary] GetClass One {klass}"); 
+		if (official == null)
+			return null;
+
+		var intermediary = Two.GetClass(official.Name);
+		//Console.WriteLine($"[Intermediary] GetClass Two {klass} {official.Name}");
+		if (intermediary == null)
+			return official;
+
+		//Console.WriteLine($"[Intermediary] GetClass End {klass} {official.Name} {intermediary.Name}"); 
+		return new IntermediaryClassMappings(One, official, intermediary);
+	}
+}
+
+internal partial class Mappings
+{
+	private static IMappings _CurrentMappings = null;
+	public static IMappings CurrentMappings {
+		get {
+			if (_CurrentMappings == null)
+				throw new InvalidOperationException("no mappings registered");
+
+			return _CurrentMappings;
+		}
+	}
+
+	[GeneratedRegex(@"L(?<Class>[^;]+);")]
+	private static partial Regex ClassPattern { get; }
+
+	internal static string RemapClassSignature(IMappings mappings, string sig)
+	{
+		return ClassPattern.Replace(sig, match => {
+			var unmapped = match.Groups["Class"].Value.Replace("/", ".");
+			var klass = mappings.GetClass(unmapped);
+			var mapped = klass != null ? klass.Name : unmapped;
+			return $"L{mapped.Replace(".", "/")};";
+		});
+	}
+
+	public static void SetMappings(IMappings mappings)
+	{
+		_CurrentMappings = mappings;
+	}
+
+	public static void SetIntermediaryMappings(IMappings mappings)
+	{
+		if (_CurrentMappings == null)
+			throw new InvalidOperationException("no mappings registered");
+
+		_CurrentMappings = new IntermediaryMappings(_CurrentMappings, mappings);
+	}
+}
